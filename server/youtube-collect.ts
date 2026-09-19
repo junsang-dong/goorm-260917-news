@@ -32,6 +32,7 @@ export type CollectedItem = {
   image: string;
   videoId: string;
   duration: string;
+  viewCount: number;
   contentHash: string;
 };
 
@@ -156,6 +157,7 @@ type VideosList = {
       thumbnails?: Record<string, { url?: string }>;
     };
     contentDetails?: { duration?: string };
+    statistics?: { viewCount?: string };
   }[];
 };
 
@@ -196,7 +198,7 @@ async function fetchVideoDetails(videoIds: string[]): Promise<CollectedItem[]> {
   const unique = [...new Set(videoIds.filter((id) => /^[\w-]{11}$/.test(id)))].slice(0, 20);
   if (!unique.length) return [];
   const videos = await ytGet<VideosList>('videos', {
-    part: 'snippet,contentDetails',
+    part: 'snippet,contentDetails,statistics',
     id: unique.join(','),
   });
   return (videos.items || []).map((v) => {
@@ -215,6 +217,7 @@ async function fetchVideoDetails(videoIds: string[]): Promise<CollectedItem[]> {
       image: image && /^https?:\/\//i.test(image) ? image : '',
       videoId: v.id,
       duration: formatIsoDuration(v.contentDetails?.duration),
+      viewCount: Math.max(0, Number(v.statistics?.viewCount || 0)),
       contentHash: `yt:${v.id}:${publishedAt || 'na'}`,
     };
   });
@@ -310,32 +313,27 @@ export async function collectYoutubeSource(source: CollectSourceInput, cursor: s
   const uploads = channel.contentDetails?.relatedPlaylists?.uploads;
   if (!uploads) throw new Error('채널 업로드 재생목록을 확인할 수 없습니다.');
 
-  const topicQueries = normalizeTopicQueries([
-    'actuator',
-    'controller',
-    'AI',
-    'artificial intelligence',
-    '인공지능',
-    '액추에이터',
-    '컨트롤러',
-  ]);
-
   const preferredIds: string[] = [];
   const seen = new Set<string>();
 
-  // 1) 채널 내에서 주제 키워드 검색 (관련도 우선)
-  for (const q of topicQueries.slice(0, 6)) {
-    if (preferredIds.length >= 12) break;
-    try {
-      const { ids } = await searchVideoIds(q, { maxResults: 5, channelId: channel.id });
-      for (const id of ids) {
-        if (seen.has(id)) continue;
-        seen.add(id);
-        preferredIds.push(id);
-      }
-    } catch {
-      /* 채널 내 검색 실패 시 업로드 목록으로 보완 */
+  // 1) 오래된 영상도 포함해 채널 조회수 순 인기 영상 우선
+  try {
+    const popular = await ytGet<SearchList>('search', {
+      part: 'snippet',
+      type: 'video',
+      channelId: channel.id,
+      order: 'viewCount',
+      maxResults: '12',
+      safeSearch: 'none',
+    });
+    for (const row of popular.items || []) {
+      const id = row.id?.videoId;
+      if (!id || !/^[\w-]{11}$/.test(id) || seen.has(id)) continue;
+      seen.add(id);
+      preferredIds.push(id);
     }
+  } catch (e) {
+    warnings.push(`인기 영상 검색 실패: ${e instanceof Error ? e.message : '오류'}`);
   }
 
   // 2) 최근 업로드로 보완 (최대 20)
@@ -360,11 +358,12 @@ export async function collectYoutubeSource(source: CollectSourceInput, cursor: s
       nextCursor: playlist.nextPageToken || null,
       warnings: ['수집할 영상이 없습니다.'],
       channelTitle: channel.snippet?.title,
-      queries: topicQueries,
+      queries: ['채널 인기 영상 · 조회수 순', '최근 업로드 보완'],
     };
   }
 
-  const items = await fetchVideoDetails(preferredIds.slice(0, 20));
+  const items = (await fetchVideoDetails(preferredIds.slice(0, 20)))
+    .sort((a, b) => b.viewCount - a.viewCount || Date.parse(b.publishedAt || '') - Date.parse(a.publishedAt || ''));
   for (const item of items) item.source = (channel.snippet?.title || source.name).slice(0, 150);
 
   if (items.length < preferredIds.length) warnings.push('일부 영상 상세 정보를 가져오지 못했습니다.');
@@ -374,6 +373,6 @@ export async function collectYoutubeSource(source: CollectSourceInput, cursor: s
     nextCursor: playlist.nextPageToken || null,
     warnings,
     channelTitle: channel.snippet?.title,
-    queries: topicQueries,
+    queries: ['채널 인기 영상 · 조회수 순', '최근 업로드 보완'],
   };
 }

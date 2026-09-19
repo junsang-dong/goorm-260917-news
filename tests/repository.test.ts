@@ -27,6 +27,8 @@ describe('IndexedDB Repository', () => {
   it('최초 실행 시 샘플을 한 번만 삽입한다', async () => {
     const first = await repo.snapshot();
     assert.ok(first.contents.length >= 8);
+    assert.equal(first.contents.filter(c => c.contentHash.startsWith('c46-reference-')).length, 30);
+    assert.ok(first.sources.length >= 30);
     await repo.close();
     repo = new RadarRepository(dbName, true);
     await repo.initialize();

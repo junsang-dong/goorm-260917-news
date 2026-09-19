@@ -77,3 +77,14 @@ export async function signInWithGoogle() {
 export async function signOutGoogle() {
   await firebaseSignOut(getFirebaseAuth());
 }
+
+export async function apiHeaders(json = false): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {};
+  if (json) headers['Content-Type'] = 'application/json';
+  if (isFirebaseConfigured()) {
+    const user = getFirebaseAuth().currentUser;
+    if (user) headers.Authorization = `Bearer ${await user.getIdToken()}`;
+  }
+  if (!headers.Authorization && import.meta.env?.DEV) headers['X-BCR-Workspace'] = 'local-development';
+  return headers;
+}

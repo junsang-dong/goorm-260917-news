@@ -1,13 +1,17 @@
-import type { Content, Source } from '../shared/schemas';
+import type { Analysis, Company, Content, Source } from '../shared/schemas';
 import { repository } from './repository';
+import { apiHeaders } from './auth/firebase-auth';
+import { referenceCatalog } from './reference-catalog';
 
 export const TOPIC_SOURCE_ID = 'a0000000-0000-4000-8000-000000000001';
 export const TOPIC_SOURCE_URL = 'https://www.youtube.com/results?search_query=robot+actuator+controller+AI';
 
 export type IntegrationStatus = {
   youtube: boolean;
+  llm?: boolean;
+  database?: boolean;
   integrations: 'off' | 'server';
-  providers: { youtube: string; rss: string; llm: string };
+  providers: { youtube: string; rss: string; llm: string; database?: string };
   topicQueries?: string[];
 };
 
@@ -23,6 +27,7 @@ export type CollectedPayload = {
     image: string;
     videoId: string;
     duration: string;
+    viewCount: number;
     contentHash: string;
   }>;
   nextCursor: string | null;
@@ -54,6 +59,18 @@ export async function fetchIntegrationStatus(): Promise<IntegrationStatus> {
   }
 }
 
+export async function analyzeContent(content: Content, company: Company): Promise<Analysis> {
+  const res = await fetch('/api/v1/analysis', {
+    method: 'POST',
+    headers: await apiHeaders(true),
+    body: JSON.stringify({ content, company }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  const result = (await res.json()) as { analysis: Analysis; titleKo: string };
+  await repository.saveAnalysis(result.analysis, result.titleKo);
+  return result.analysis;
+}
+
 function toContents(items: CollectedPayload['items'], fallbackSource: string): Content[] {
   const now = new Date().toISOString();
   return items.map((item) => ({
@@ -71,6 +88,7 @@ function toContents(items: CollectedPayload['items'], fallbackSource: string): C
     image: item.image || '',
     videoId: item.videoId,
     duration: item.duration || undefined,
+    viewCount: item.viewCount || undefined,
     dedupKey: '',
     contentHash: item.contentHash,
   }));
@@ -79,7 +97,7 @@ function toContents(items: CollectedPayload['items'], fallbackSource: string): C
 export async function collectFromSource(source: Source, cursor: string | null = null): Promise<CollectedPayload> {
   const res = await fetch('/api/v1/integrations/collect', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await apiHeaders(true),
     body: JSON.stringify({
       mode: 'channel',
       source: { id: source.id, name: source.name, url: source.url, type: source.type },
@@ -93,7 +111,7 @@ export async function collectFromSource(source: Source, cursor: string | null = 
 export async function collectTopics(keywords: string[] = [], cursor: string | null = null): Promise<CollectedPayload> {
   const res = await fetch('/api/v1/integrations/collect', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await apiHeaders(true),
     body: JSON.stringify({ mode: 'topics', keywords, cursor }),
   });
   if (!res.ok) throw new Error(await parseError(res));
@@ -144,4 +162,33 @@ export async function runYoutubeTopicCollect(extraKeywords: string[] = []) {
     runLabel: 'YouTube 주제 검색',
   });
   return { ...report, warnings: result.warnings, queries: result.queries || [], nextCursor: result.nextCursor };
+}
+
+export async function bootstrapPopularYoutubeCatalog() {
+  const marker = await repository.getMeta<string>('popularYoutubeCatalogV2');
+  if (marker) return { added: 0, updated: 0, skipped: true, warnings: [] as string[] };
+  const status = await fetchIntegrationStatus();
+  if (!status.youtube) return { added: 0, updated: 0, skipped: true, warnings: ['YouTube API가 연결되지 않았습니다.'] };
+
+  const urls = new Set(referenceCatalog.filter((entry) => entry.type === 'video').map((entry) => entry.url));
+  const snapshot = await repository.snapshot();
+  const sources = snapshot.sources.filter((source) => source.type === 'video' && source.enabled && urls.has(source.url));
+  let added = 0;
+  let updated = 0;
+  const warnings: string[] = [];
+
+  for (let index = 0; index < sources.length; index += 2) {
+    const settled = await Promise.allSettled(sources.slice(index, index + 2).map((source) => runYoutubeCollect(source)));
+    settled.forEach((result, offset) => {
+      if (result.status === 'fulfilled') {
+        added += result.value.added;
+        updated += result.value.updated;
+        warnings.push(...result.value.warnings);
+      } else {
+        warnings.push(`${sources[index + offset]?.name || 'YouTube 채널'}: ${result.reason instanceof Error ? result.reason.message : '수집 실패'}`);
+      }
+    });
+  }
+  if (added + updated > 0) await repository.setMeta('popularYoutubeCatalogV2', new Date().toISOString());
+  return { added, updated, skipped: false, warnings };
 }
